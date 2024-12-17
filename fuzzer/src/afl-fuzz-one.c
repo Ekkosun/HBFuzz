@@ -5932,7 +5932,7 @@ void havoc_mutation(u8* data, u64 len, u32 steps) {
                 data[rand() % len] ^= 1 << (rand() % 8);
                 break;
             case 1:
-                data[rand() % len] += (uint8_t)(rand() % 5) - 2;
+                data[rand() % len] += (uint8_t)(rand() % 32) - 16;
                 break;
             case 2:
                 data[rand() % len] = (uint8_t)(rand() % 256);
@@ -5965,10 +5965,44 @@ int fuzz_one_hbf(afl_state_t *afl){
   u8 * buf = queue_testcase_get(afl, afl->queue_cur);
   u32  len = afl->queue_cur->len;
   u32  perf_score = 100;
+  u32  read_size = 0;
   u8 * backup = ck_alloc_nozero(len);
   u8 * changed = ck_alloc_nozero(len);
   u8 * backup_virgin_bits = ck_alloc_nozero(afl->fsrv.map_size);
 
+
+  if (likely(afl->pending_favored)) {
+
+    /* If we have any favored, non-fuzzed new arrivals in the queue,
+       possibly skip to them at the expense of already-fuzzed or non-favored
+       cases. */
+
+    if ((afl->queue_cur->fuzz_level || !afl->queue_cur->favored) &&
+        likely(rand_below(afl, 100) < SKIP_TO_NEW_PROB)) {
+
+      goto hbf_failed;
+
+    }
+
+  } else if (!afl->non_instrumented_mode && !afl->queue_cur->favored &&
+
+             afl->queued_items > 10) {
+
+    /* Otherwise, still possibly skip non-favored cases, albeit less often.
+       The odds of skipping stuff are higher for already-fuzzed inputs and
+       lower for never-fuzzed entries. */
+
+    if (afl->queue_cycle > 1 && !afl->queue_cur->fuzz_level) {
+
+      if (likely(rand_below(afl, 100) < SKIP_NFAV_NEW_PROB)) { goto hbf_failed; }
+
+    } else {
+
+      if (likely(rand_below(afl, 100) < SKIP_NFAV_OLD_PROB)) { goto hbf_failed; }
+
+    }
+
+  }
 
   // caculate score
   if (likely(!afl->old_seed_selection))
@@ -5983,7 +6017,7 @@ int fuzz_one_hbf(afl_state_t *afl){
 
   }
 
-  
+
   // extract interval infomation
   FILE * fp = fopen(tmp_file, "wb");
   char stdout_buf[1024];
@@ -6002,6 +6036,7 @@ int fuzz_one_hbf(afl_state_t *afl){
         if(size * count + pos > len)
           continue;
         ranges = add_range(ranges, pos, pos + count * size - 1);
+        read_size += (pos + count * size - 1);
       }
     }
   }
@@ -6087,107 +6122,108 @@ int fuzz_one_hbf(afl_state_t *afl){
     if (get_cur_time() - cur_time > timeout) {break;}
   }
 
-  
-  afl->queue_cur->passed_det = 1;
-  if(afl->queue_cur->passed_det) {goto hbf_failed;}
-  else {afl->queue_cur->passed_det = 1;}
-
-  memcpy(changed, buf, len);
-  memcpy(buf, backup, len);
-  FLIP_BITS(changed, 0, len - 1);
-  u64 cricial_bytes = 0;
-  afl->stage_name = "hbf-bin-search";
-  afl->stage_short = "hbfbs";
-  afl->stage_max = (len << 1);
-  afl->stage_cur = 0;
-  show_stats(afl);
-  memcpy(backup_virgin_bits, afl->virgin_bits, afl->fsrv.map_size);
-
-  while ((rng = pop_biggest_range(&ranges)) != NULL &&
-         afl->stage_cur < afl->stage_max) {
-    u32 s = 1 + rng->end - rng->start;
-    memcpy(buf + rng->start, changed + rng->start, s);
-    common_fuzz_stuff(afl, buf, len);
-    if (has_new_bits_no_change(afl, backup_virgin_bits) == 2){
-      // fprintf(stderr, "find interest interval (%d %d): has new bits %d \n", rng->start, rng->end, has_new_bits_no_change(afl, backup_virgin_bits));
-      if(s > 1){
-        int left = rng->start - 1 + s / 2;
-        int left_has_new_bits = 0, right_has_new_bits = 0;
-        
-        // run left
-        memcpy(buf + left + 1, backup + left + 1, rng->end - left);
-        common_fuzz_stuff(afl, buf, len);
-        left_has_new_bits = has_new_bits_no_change(afl, backup_virgin_bits);
-        // run right
-        memcpy(buf + rng->start, backup + rng->start, left - rng->start + 1);
-        memcpy(buf + left + 1, changed + left + 1, rng->end - left);
-        common_fuzz_stuff(afl, buf, len);
-        right_has_new_bits = has_new_bits_no_change(afl, backup_virgin_bits);
-        
-        if(left_has_new_bits == 2) {
-          ranges = add_range(ranges, rng->start, left);
-          // fprintf(stderr, "add (%d %d): %d \n", rng->start, left);
-        }
-        if(right_has_new_bits == 2) {
-          ranges = add_range(ranges, left + 1, rng->end);
-          // fprintf(stderr, "add (%d %d): %d \n", rng->start + s / 2, rng->end);
-        }
-        if(left_has_new_bits != 2 && right_has_new_bits != 2) {
-          // fprintf(stderr, "verified interest interval (%d %d), len %d : has new bits\n", rng->start, rng->end, rng->end - rng->start + 1);
+  if (afl->queue_cur->passed_det == 0){
+    memcpy(changed, buf, len);
+    memcpy(buf, backup, len);
+    FLIP_BITS(changed, 0, len - 1);
+    u64 cricial_bytes = 0;
+    afl->stage_name = "hbf-bin-search";
+    afl->stage_short = "hbfbs";
+    afl->stage_max = (len << 1);
+    afl->stage_cur = 0;
+    show_stats(afl);
+    memcpy(backup_virgin_bits, afl->virgin_bits, afl->fsrv.map_size);
+    cur_time = get_cur_time();
+    while ((rng = pop_biggest_range(&ranges)) != NULL &&
+          afl->stage_cur < afl->stage_max) {
+      if (get_cur_time() - cur_time > timeout) {break;}
+      u32 s = 1 + rng->end - rng->start;
+      memcpy(buf + rng->start, changed + rng->start, s);
+      common_fuzz_stuff(afl, buf, len);
+      if (has_new_bits_no_change(afl, backup_virgin_bits) == 2){
+        // fprintf(stderr, "find interest interval (%d %d): has new bits %d \n", rng->start, rng->end, has_new_bits_no_change(afl, backup_virgin_bits));
+        if(s > 1){
+          int left = rng->start - 1 + s / 2;
+          int left_has_new_bits = 0, right_has_new_bits = 0;
+          
+          // run left
+          memcpy(buf + left + 1, backup + left + 1, rng->end - left);
+          common_fuzz_stuff(afl, buf, len);
+          left_has_new_bits = has_new_bits_no_change(afl, backup_virgin_bits);
+          // run right
+          memcpy(buf + rng->start, backup + rng->start, left - rng->start + 1);
+          memcpy(buf + left + 1, changed + left + 1, rng->end - left);
+          common_fuzz_stuff(afl, buf, len);
+          right_has_new_bits = has_new_bits_no_change(afl, backup_virgin_bits);
+          
+          if(left_has_new_bits == 2) {
+            ranges = add_range(ranges, rng->start, left);
+            // fprintf(stderr, "add (%d %d): %d \n", rng->start, left);
+          }
+          if(right_has_new_bits == 2) {
+            ranges = add_range(ranges, left + 1, rng->end);
+            // fprintf(stderr, "add (%d %d): %d \n", rng->start + s / 2, rng->end);
+          }
+          if(left_has_new_bits != 2 && right_has_new_bits != 2) {
+            // fprintf(stderr, "verified interest interval (%d %d), len %d : has new bits\n", rng->start, rng->end, rng->end - rng->start + 1);
+            cricial_ranges = add_range(cricial_ranges, rng->start, rng->end);
+            cricial_bytes += 1;
+          }
+        }else{
           cricial_ranges = add_range(cricial_ranges, rng->start, rng->end);
           cricial_bytes += 1;
         }
-      }else{
-        cricial_ranges = add_range(cricial_ranges, rng->start, rng->end);
-        cricial_bytes += 1;
       }
+
+      if (ranges == rng) {
+
+        ranges = rng->next;
+        if (ranges) { ranges->prev = NULL; }
+
+      } else if (rng->next) {
+
+        rng->prev->next = rng->next;
+        rng->next->prev = rng->prev;
+
+      } else {
+
+        if (rng->prev) { rng->prev->next = NULL; }
+
+      }
+
+        memcpy(buf + rng->start, backup + rng->start, s);
+        free(rng);
+        if (unlikely(++afl->stage_cur % 10 == 0)) { show_stats(afl); };
     }
 
-    if (ranges == rng) {
-
-      ranges = rng->next;
-      if (ranges) { ranges->prev = NULL; }
-
-    } else if (rng->next) {
-
-      rng->prev->next = rng->next;
-      rng->next->prev = rng->prev;
-
-    } else {
-
-      if (rng->prev) { rng->prev->next = NULL; }
-
-    }
-
-      memcpy(buf + rng->start, backup + rng->start, s);
-      free(rng);
-      if (unlikely(++afl->stage_cur % 10 == 0)) { show_stats(afl); };
-  }
-
-  memcpy(buf, backup, len);
-  afl->stage_name = "hbf-iter";
-  afl->stage_short = "hbfi";
-  afl->stage_max = cricial_bytes * 256;
-  afl->stage_cur = 0;
-  show_stats(afl);
-  
-  rng = cricial_ranges;
-  while(rng && afl->stage_cur < afl->stage_max){
-    int start = rng->start;
-    int end = rng->end;
-    u64 cur_time = get_cur_time();
-    for(int i = 0; i < 256; i++){
-      for (int j = start; j < end; j++) {buf[j] += i;};
-      common_fuzz_stuff(afl, buf, len);
-      afl->stage_cur++;
-      if (i == 20 && afl->last_find_time < cur_time){break;}
-    }
-    memcpy(buf + start, backup + start, end - start + 1);
-    rng = rng->next;  
+    memcpy(buf, backup, len);
+    afl->stage_name = "hbf-iter";
+    afl->stage_short = "hbfi";
+    afl->stage_max = 0;
+    afl->stage_cur = 0;
     show_stats(afl);
-  }
+    
+    rng = cricial_ranges;
+    while (rng && afl->stage_cur < afl->stage_max) {
+      int start = rng->start;
+      int end = rng->end;
+      afl->stage_max += (start - end) * 256;
+      u64 cur_time = get_cur_time();
+      for (int i = start; i < end; i++) {
+        for (int j = 0; j < 256; j++) {
+          buf[i] = j;
+          common_fuzz_stuff(afl, buf, len);
+          afl->stage_cur++;
+        }
+        show_stats(afl);
+      }
+      memcpy(buf + start, backup + start, end - start + 1);
+      rng = rng->next;
+      show_stats(afl);
+    }
 
-  memcpy(buf, backup, len);
+    memcpy(buf, backup, len);
+  }
 
   while (ranges) {
 
@@ -6242,6 +6278,11 @@ u8 fuzz_one(afl_state_t *afl) {
        limit_time_sig  < 0 both are run
   */
 
+  char * use_hbf = getenv("AFL_USE_HBF");
+  int find_new = afl->queued_items;
+  if (use_hbf) {fuzz_one_hbf(afl);}
+
+  if (find_new != afl->queued_items) { return 0; }
   if (afl->limit_time_sig <= 0) { key_val_lv_1 = fuzz_one_original(afl); }
 
   if (afl->limit_time_sig != 0) {
@@ -6261,8 +6302,7 @@ u8 fuzz_one(afl_state_t *afl) {
     }
 
   }
-  char * use_hbf = getenv("AFL_USE_HBF");
-  if (use_hbf && !key_val_lv_1) {fuzz_one_hbf(afl);}
+
   return (key_val_lv_1 | key_val_lv_2);
 
 }
